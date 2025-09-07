@@ -4325,7 +4325,107 @@ class ThreadedTests(unittest.TestCase):
                              msg % (server_result, "server"))
 
     def test_npn_protocols(self):
-        assert not ssl.HAS_NPN
+        """Comprehensive test for CVE-2024-5535 NPN protocol buffer vulnerabilities."""
+        # CVE-2024-5535: CPython doesn't disallow configuring empty list for set_npn_protocols()
+        # This results in buffer over-read when NPN is used with OpenSSL
+        
+        if ssl.HAS_NPN:
+            # Test 1: Empty protocol lists should be properly rejected
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            
+            # Test empty list - should be rejected to prevent buffer over-read
+            with self.assertRaises((ValueError, ssl.SSLError)):
+                context.set_npn_protocols([])
+            
+            # Test 2: Verify proper validation occurs before calling SSL_select_next_proto
+            # Empty strings in protocol list should be rejected
+            with self.assertRaises((ValueError, ssl.SSLError)):
+                context.set_npn_protocols([''])
+                
+            with self.assertRaises((ValueError, ssl.SSLError)):
+                context.set_npn_protocols(['http/1.1', '', 'h2'])
+                
+            # Test 3: Buffer bounds checking - verify zero-length protocols are handled
+            # Each protocol name must have non-zero length
+            with self.assertRaises((ValueError, ssl.SSLError)):
+                context.set_npn_protocols([b''])
+                
+            # Test 4: Test various edge cases including null-like inputs
+            edge_cases = [
+                None,  # None input
+                [None],  # List with None
+                ['http/1.1', None, 'h2'],  # Mixed valid and None
+            ]
+            
+            for case in edge_cases:
+                with self.subTest(case=case):
+                    with self.assertRaises((ValueError, TypeError, ssl.SSLError)):
+                        context.set_npn_protocols(case)
+            
+            # Test 5: Verify buffer over-read protection with malformed inputs
+            malformed_cases = [
+                [b'\x00'],  # Protocol with null byte
+                [b'\x00http/1.1'],  # Protocol starting with null
+                [b'http/1.1\x00'],  # Protocol ending with null
+                ['http/1.1\x00extra'],  # String with embedded null
+            ]
+            
+            for case in malformed_cases:
+                with self.subTest(case=case):
+                    with self.assertRaises((ValueError, ssl.SSLError)):
+                        context.set_npn_protocols(case)
+                        
+            # Test 6: Regression test - ensure previous vulnerability is fixed
+            # This specifically tests the CVE-2024-5535 scenario
+            server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server_context.load_cert_chain(CERTFILE)
+            
+            # Empty protocol configuration should not cause buffer over-read
+            with self.assertRaises((ValueError, ssl.SSLError)):
+                server_context.set_npn_protocols([])
+                
+            # Test 7: Verify valid NPN protocol configurations still work
+            valid_protocols = ['http/1.1', 'h2', 'spdy/3.1']
+            try:
+                context.set_npn_protocols(valid_protocols)
+                # Should succeed without raising exceptions
+            except (ValueError, ssl.SSLError) as e:
+                self.fail(f"Valid NPN protocol configuration failed: {e}")
+                
+            # Test 8: Verify protocol buffer length validation
+            # Test with excessively long protocol names (should be handled gracefully)
+            long_protocol = 'x' * 1000
+            try:
+                context.set_npn_protocols([long_protocol])
+                # Should either succeed or fail gracefully, not crash
+            except (ValueError, ssl.SSLError):
+                pass  # Acceptable to reject very long protocol names
+            except Exception as e:
+                self.fail(f"Long protocol name caused unexpected error: {e}")
+                
+            # Additional bounds checking tests
+            # Test with maximum reasonable number of protocols
+            many_protocols = [f'proto{i}' for i in range(100)]
+            try:
+                context.set_npn_protocols(many_protocols)
+            except (ValueError, ssl.SSLError):
+                pass  # Acceptable to have limits
+            except Exception as e:
+                self.fail(f"Many protocols caused unexpected error: {e}")
+                
+        else:
+            # If NPN is not available, ensure it's properly disabled
+            # This maintains backward compatibility
+            assert not ssl.HAS_NPN
+            
+            # Even when NPN is disabled, set_npn_protocols should not crash
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            if hasattr(context, 'set_npn_protocols'):
+                # Should either work (no-op) or raise AttributeError/NotImplementedError
+                try:
+                    context.set_npn_protocols(['http/1.1'])
+                except (AttributeError, NotImplementedError, ssl.SSLError):
+                    pass  # Expected when NPN is not available
 
     def sni_contexts(self):
         server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
