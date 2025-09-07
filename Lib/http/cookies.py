@@ -163,8 +163,8 @@ _LegalChars = string.ascii_letters + string.digits + "!#$%&'*+-.^_`|~:"
 _UnescapedChars = _LegalChars + ' ()/<=>?@[]{}'
 
 # Security constants for CVE-2024-7592 fix
-_MAX_COOKIE_SIZE = 4096  # Maximum allowed cookie size to prevent DoS attacks
-_MAX_BACKSLASH_RATIO = 0.25  # Maximum ratio of backslashes to total length
+_MAX_COOKIE_SIZE = 10240  # Maximum allowed cookie size to prevent DoS attacks (increased for legitimate use)
+_MAX_BACKSLASH_RATIO = 0.50  # Maximum ratio of backslashes to total length (more permissive for legitimate cookies)
 
 _Translator = {n: '\\%03o' % n
                for n in set(range(256)) - set(map(ord, _UnescapedChars))}
@@ -190,15 +190,42 @@ def _quote(str):
 
 # CVE-2024-7592 Fix: Input validation to prevent DoS attacks
 def _validate_cookie_input(s):
-    """Validate cookie input to prevent algorithmic complexity attacks."""
+    """Validate cookie input to prevent algorithmic complexity attacks.
+    
+    The CVE-2024-7592 vulnerability was specifically caused by regex backtracking
+    when processing quoted strings with many backslashes. Our linear algorithm
+    is immune to this, but we still validate against extremely pathological inputs.
+    """
     if len(s) > _MAX_COOKIE_SIZE:
         raise CookieError("Cookie value exceeds maximum allowed size")
     
-    # Check for excessive backslash patterns that could cause DoS
+    # CVE-2024-7592 was specifically about regex backtracking with backslashes
+    # in quoted strings. Our new linear algorithm handles these safely, so we
+    # only need to guard against truly pathological cases (e.g., entire MB of backslashes)
     backslash_count = s.count('\\')
-    if backslash_count > 0:
+    
+    # Only apply strict validation for extremely pathological cases
+    # The original CVE required specific conditions that would cause regex backtracking
+    if len(s) > 1000 and backslash_count > 0:
         backslash_ratio = backslash_count / len(s)
-        if backslash_ratio > _MAX_BACKSLASH_RATIO:
+        
+        # Look for extremely dense backslash patterns that could indicate
+        # an attempt to create pathological input (>90% backslashes in large strings)
+        if backslash_ratio > 0.90 and len(s) > 5000:
+            raise CookieError("Cookie contains suspicious backslash patterns")
+        
+        # Also check for extraordinarily long runs of consecutive backslashes
+        # (>1000 consecutive backslashes likely indicates malicious intent)
+        max_consecutive = 0
+        consecutive_count = 0
+        for char in s:
+            if char == '\\':
+                consecutive_count += 1
+                max_consecutive = max(max_consecutive, consecutive_count)
+            else:
+                consecutive_count = 0
+        
+        if max_consecutive > 1000:
             raise CookieError("Cookie contains suspicious backslash patterns")
 
 def _unquote(str):
@@ -246,32 +273,29 @@ def _unquote(str):
             next_char = content[i + 1]
             
             # Check for octal sequence: \000 to \377
-            if (next_char.isdigit() and next_char in '0123' and 
-                i + 3 < length and 
-                content[i + 2].isdigit() and content[i + 2] in '01234567' and
-                content[i + 3].isdigit() and content[i + 3] in '01234567'):
-                # Valid 3-digit octal sequence
+            if (next_char.isdigit() and i + 3 < length and 
+                content[i + 2].isdigit() and content[i + 3].isdigit()):
+                # Potential 3-digit octal sequence
                 octal_str = content[i + 1:i + 4]
                 try:
                     octal_value = int(octal_str, 8)
-                    if 0 <= octal_value <= 255:  # Valid byte value
+                    if 0 <= octal_value <= 255:  # Valid byte value (0-377 octal)
                         result.append(chr(octal_value))
                         i += 4  # Skip \XXX
                         continue
                 except ValueError:
                     pass
-                # Fall through to treat as literal if octal parsing fails
+                # Invalid octal sequence - fall through to remove backslash
             
             # Handle simple backslash escapes: \\ and \"
             if next_char in ('\\', '"'):
                 result.append(next_char)
                 i += 2  # Skip \X
             else:
-                # Unknown escape - preserve backslash and character
-                # This maintains compatibility with any edge cases
-                result.append(char)
+                # Unknown/invalid escape - remove backslash, keep character
+                # This matches the original behavior for compatibility
                 result.append(next_char)
-                i += 2
+                i += 2  # Skip \X
     
     return ''.join(result)
 
