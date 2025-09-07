@@ -83,6 +83,7 @@ def validate_openssl_version(ssl_dir):
         
     # Try to read version from VERSION.dat (OpenSSL 3.x format)
     version_file = os.path.join(ssl_dir, "VERSION.dat")
+    version_found = False
     if os.path.exists(version_file):
         try:
             with open(version_file, 'r', encoding='utf-8') as f:
@@ -98,29 +99,32 @@ def validate_openssl_version(ssl_dir):
                                 return True
                             print(f"WARNING: OpenSSL version {version_str} is below required 3.0.15")
                             return False
+                        version_found = True  # Found VERSION= line but couldn't parse it
         except IOError as e:
             print(f"Error reading VERSION.dat: {e}")
     
-    # Fallback: try to read from opensslv.h (legacy method)
-    header_file = os.path.join(ssl_dir, "include", "openssl", "opensslv.h")
-    if os.path.exists(header_file):
-        try:
-            with open(header_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-                # Look for version definition
-                version_match = re.search(r'#\s*define\s+OPENSSL_VERSION_TEXT\s+"OpenSSL\s+(\d+\.\d+\.\d+[^"]*)"', content)
-                if version_match:
-                    version_str = version_match.group(1)
-                    version_tuple = parse_openssl_version(version_str)
-                    if version_tuple:
-                        major, minor, patch = version_tuple
-                        # Check if version >= 3.0.15
-                        if major > 3 or (major == 3 and minor > 0) or (major == 3 and minor == 0 and patch >= 15):
-                            return True
-                        print(f"WARNING: OpenSSL version {version_str} is below required 3.0.15")
-                        return False
-        except IOError as e:
-            print(f"Error reading opensslv.h: {e}")
+    # Fallback: try to read from opensslv.h (legacy method) if VERSION.dat didn't contain version info
+    if not version_found:
+        header_file = os.path.join(ssl_dir, "include", "openssl", "opensslv.h")
+        if os.path.exists(header_file):
+            try:
+                with open(header_file, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                    # Look for version definition
+                    version_match = re.search(r'#\s*define\s+OPENSSL_VERSION_TEXT\s+"OpenSSL\s+(\d+\.\d+\.\d+)', content)
+                    if version_match:
+                        version_str = version_match.group(1)
+                        version_tuple = parse_openssl_version(version_str)
+                        if version_tuple:
+                            major, minor, patch = version_tuple
+                            # Check if version >= 3.0.15
+                            if major > 3 or (major == 3 and minor > 0) or (major == 3 and minor == 0 and patch >= 15):
+                                return True
+                            print(f"WARNING: OpenSSL version {version_str} is below required 3.0.15")
+                            return False
+                        version_found = True
+            except IOError as e:
+                print(f"Error reading opensslv.h: {e}")
     
     raise ValueError(f"Cannot determine OpenSSL version from {ssl_dir}")
 
@@ -170,7 +174,7 @@ def copy_includes(makefile, suffix):
         makefile (str): Path to the makefile to parse
         suffix (str): Architecture suffix ("32" or "64")
     """
-    dir = 'inc'+suffix+'\\openssl'
+    dir = os.path.join('inc'+suffix, 'openssl')
     try:
         os.makedirs(dir)
     except OSError:
