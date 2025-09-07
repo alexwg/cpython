@@ -7475,8 +7475,8 @@ WITH_SAVE_ENV([
     AC_LINK_IFELSE([AC_LANG_PROGRAM([
       #include <openssl/opensslv.h>
       #include <openssl/ssl.h>
-      #if OPENSSL_VERSION_NUMBER < 0x10101000L
-        #error "OpenSSL >= 1.1.1 is required"
+      #if OPENSSL_VERSION_NUMBER < 0x30000f00L
+        #error "OpenSSL >= 3.0.15 is required"
       #endif
       static void keylog_cb(const SSL *ssl, const char *line) {}
     ], [
@@ -7500,8 +7500,8 @@ WITH_SAVE_ENV([
     AC_LINK_IFELSE([AC_LANG_PROGRAM([
       #include <openssl/opensslv.h>
       #include <openssl/evp.h>
-      #if OPENSSL_VERSION_NUMBER < 0x10101000L
-        #error "OpenSSL >= 1.1.1 is required"
+      #if OPENSSL_VERSION_NUMBER < 0x30000f00L
+        #error "OpenSSL >= 3.0.15 is required"
       #endif
     ], [
       OBJ_nid2sn(NID_md5);

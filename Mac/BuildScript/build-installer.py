@@ -825,6 +825,29 @@ def build_universal_openssl(basedir, archList):
     separately then lipo them together into fat libraries.
     """
 
+    # Security fix: Add compile-time version check for OpenSSL (CVE-2024-5535 mitigation)
+    # Verify that OpenSSL version is at least 3.0.15 before proceeding with build
+    srcdir_name = os.path.basename(os.getcwd())
+    if srcdir_name.startswith('openssl-'):
+        version_str = srcdir_name[8:]  # Remove 'openssl-' prefix
+        try:
+            # Parse version string (e.g., "3.0.16" -> [3, 0, 16])
+            version_parts = [int(x) for x in version_str.split('.')]
+            if len(version_parts) >= 3:
+                major, minor, patch = version_parts[0], version_parts[1], version_parts[2]
+                # Check if version is >= 3.0.15
+                if (major, minor, patch) < (3, 0, 15):
+                    fatal("OpenSSL version %s is below minimum required version 3.0.15. "
+                          "Please upgrade to OpenSSL 3.0.15 or later to address security vulnerabilities." % version_str)
+                else:
+                    print("OpenSSL version %s validated - meets minimum security requirement (>= 3.0.15)" % version_str)
+            else:
+                print("WARNING: Could not parse OpenSSL version from directory name: %s" % srcdir_name)
+        except (ValueError, IndexError) as e:
+            print("WARNING: Could not parse OpenSSL version from directory name: %s (%s)" % (srcdir_name, e))
+    else:
+        print("WARNING: Expected OpenSSL source directory to start with 'openssl-', got: %s" % srcdir_name)
+
     # OpenSSL fails to build with Xcode 2.5 (on OS X 10.4).
     # If we are building on a 10.4.x or earlier system,
     # unilaterally disable assembly code building to avoid the problem.

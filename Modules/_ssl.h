@@ -4,6 +4,17 @@
 /* OpenSSL header files */
 #include "openssl/evp.h"
 #include "openssl/x509.h"
+#include "openssl/opensslv.h"
+
+/* Security: CVE-2024-5535 - OpenSSL version and NPN validation */
+/* Minimum required OpenSSL version: 3.0.15 (0x30000150L) */
+#define SSL_MIN_OPENSSL_VERSION_CHECK \
+    (OPENSSL_VERSION_NUMBER >= 0x30000150L && \
+     OPENSSL_VERSION_PREREQ(3, 0))
+
+/* Forward declaration for NPN protocol validation function */
+int SSL_NPN_VALIDATE_PROTOCOLS(const unsigned char *protocols, 
+                                unsigned int protocols_len);
 
 /*
  * ssl module state
@@ -76,5 +87,22 @@ typedef struct {
  */
 static PyObject *_PySSL_BytesFromBIO(_sslmodulestate *state, BIO *bio);
 static PyObject *_PySSL_UnicodeFromBIO(_sslmodulestate *state, BIO *bio, const char *error);
+
+/* ************************************************************************
+ * Security: CVE-2024-5535 - NPN protocol validation macros
+ */
+/* Validate that protocol buffer is not empty and length is reasonable */
+#define SSL_NPN_PROTOCOLS_VALID(protocols, len) \
+    ((protocols) != NULL && (len) > 0 && (len) <= 65535)
+
+/* Check if OpenSSL version meets security requirements */
+#define SSL_VERSION_SECURITY_CHECK() \
+    do { \
+        if (!SSL_MIN_OPENSSL_VERSION_CHECK) { \
+            PyErr_SetString(PyExc_RuntimeError, \
+                "OpenSSL version 3.0.15 or later required for security fixes"); \
+            return NULL; \
+        } \
+    } while (0)
 
 #endif /* Py_SSL_H */

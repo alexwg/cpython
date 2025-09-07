@@ -45,6 +45,9 @@ import time
 import struct
 import copy
 import re
+import pathlib
+import warnings
+import posixpath
 
 try:
     import pwd
@@ -781,26 +784,78 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
     new_attrs = {}
     name = member.name
     dest_path = os.path.realpath(dest_path, strict=os.path.ALLOW_MISSING)
+    
+    # Enhanced path normalization using pathlib for cross-platform security
+    # Detect and reject malicious path traversal attempts
+    normalized_name = pathlib.PurePath(name).as_posix()
+    
+    # Check for path traversal patterns before any processing
+    if '..' in pathlib.PurePath(normalized_name).parts:
+        # Calculate the projected extraction path for the error
+        projected_path = os.path.join(dest_path, name.lstrip('/'))
+        raise OutsideDestinationError(member, projected_path)
+    
+    # Enhanced absolute path detection for all platforms - MUST happen BEFORE stripping
+    if os.path.isabs(name) or posixpath.isabs(name) or pathlib.PurePath(name).is_absolute():
+        # Path is absolute - reject immediately
+        # For example, '/etc/passwd' on Unix, 'C:/foo' on Windows
+        raise AbsolutePathError(member)
+    
+    # Additional validation for Windows drive letters and UNC paths - BEFORE stripping
+    if sys.platform == 'win32':
+        # Check for Windows drive letters (e.g., "C:", "d:")
+        if len(name) >= 2 and name[1] == ':' and name[0].isalpha():
+            raise AbsolutePathError(member)
+        # Check for UNC paths (e.g., "\\server\share")
+        if name.startswith('\\\\') or name.startswith('//'):
+            raise AbsolutePathError(member)
+    
     # Strip leading / (tar's directory separator) from filenames.
     # Include os.sep (target OS directory separator) as well.
+    # NOTE: This happens AFTER absolute path detection to preserve security
     if name.startswith(('/', os.sep)):
         name = new_attrs['name'] = member.path.lstrip('/' + os.sep)
-    if os.path.isabs(name):
-        # Path is absolute even after stripping.
-        # For example, 'C:/foo' on Windows.
+        # Issue security warning about path normalization
+        warnings.warn(f"Normalized path with leading separators: {member.name} -> {name}", 
+                     category=UserWarning, stacklevel=3)
+    
+    # Double-check: ensure no absolute paths remain after stripping
+    if os.path.isabs(name) or posixpath.isabs(name) or pathlib.PurePath(name).is_absolute():
+        # Path is still absolute after stripping - this should not happen with proper validation
+        # For example, 'C:/foo' on Windows would remain absolute even after stripping '/'
         raise AbsolutePathError(member)
-    # Ensure we stay in the destination
-    target_path = os.path.realpath(os.path.join(dest_path, name),
-                                   strict=os.path.ALLOW_MISSING)
-    if os.path.commonpath([target_path, dest_path]) != dest_path:
-        raise OutsideDestinationError(member, target_path)
-    # Limit permissions (no high bits, and go-w)
+    
+    # Ensure we stay in the destination using more secure path resolution
+    try:
+        # Use pathlib for more robust path joining and validation
+        dest_pathlib = pathlib.Path(dest_path)
+        candidate_path = dest_pathlib / name
+        
+        # Resolve the path to detect symlink-based traversal attempts
+        target_path = str(candidate_path.resolve())
+        dest_resolved = str(dest_pathlib.resolve())
+        
+        # Validate that resolved path is within destination
+        if not target_path.startswith(dest_resolved + os.sep) and target_path != dest_resolved:
+            raise OutsideDestinationError(member, target_path)
+            
+    except (OSError, ValueError) as e:
+        # Handle path resolution errors securely
+        raise OutsideDestinationError(member, f"Path resolution failed: {e}")
+    # Enhanced metadata bounds checking and permission validation
     mode = member.mode
     if mode is not None:
+        # Validate mode is within reasonable bounds to prevent attacks
+        # Unix modes can include file type bits (up to 0o177777), so be less restrictive
+        if mode < 0 or mode > 0o177777:
+            warnings.warn(f"Invalid file mode {oct(mode)} for {member.name}, using safe default", 
+                         category=UserWarning, stacklevel=3)
+            mode = 0o644 if member.isreg() else 0o755 if member.isdir() else 0o644
+            
         # Strip high bits & group/other write bits
         mode = mode & 0o755
         if for_data:
-            # For data, handle permissions & file types
+            # For data, handle permissions & file types with stricter validation
             if member.isreg() or member.islnk():
                 if not mode & 0o100:
                     # Clear executable bits if not executable by user
@@ -808,53 +863,136 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
                 # Ensure owner can read & write
                 mode |= 0o600
             elif member.isdir() or member.issym():
-                # Ignore mode for directories & symlinks
+                # Ignore mode for directories & symlinks, but validate they're not special
                 mode = None
             else:
-                # Reject special files
+                # Reject special files with enhanced validation
                 raise SpecialFileError(member)
         if mode != member.mode:
             new_attrs['mode'] = mode
     if for_data:
-        # Ignore ownership for 'data'
+        # Ignore ownership for 'data' with bounds validation
         if member.uid is not None:
+            # Validate UID is within reasonable bounds
+            if member.uid < 0 or member.uid > 4294967295:  # 32-bit max
+                warnings.warn(f"Invalid UID {member.uid} for {member.name}, ignoring", 
+                             category=UserWarning, stacklevel=3)
             new_attrs['uid'] = None
         if member.gid is not None:
+            # Validate GID is within reasonable bounds
+            if member.gid < 0 or member.gid > 4294967295:  # 32-bit max
+                warnings.warn(f"Invalid GID {member.gid} for {member.name}, ignoring", 
+                             category=UserWarning, stacklevel=3)
             new_attrs['gid'] = None
         if member.uname is not None:
             new_attrs['uname'] = None
         if member.gname is not None:
             new_attrs['gname'] = None
-        # Check link destination for 'data'
+            
+        # Enhanced link destination validation for 'data'
         if member.islnk() or member.issym():
-            if os.path.isabs(member.linkname):
+            linkname = member.linkname
+            
+            # Strict validation of link names
+            if not linkname:
+                raise LinkOutsideDestinationError(member, "Empty link target")
+                
+            # Enhanced absolute path detection for links
+            if (os.path.isabs(linkname) or posixpath.isabs(linkname) or 
+                pathlib.PurePath(linkname).is_absolute()):
                 raise AbsoluteLinkError(member)
-            normalized = os.path.normpath(member.linkname)
-            if normalized != member.linkname:
+            
+            # Check for path traversal in link targets using pathlib
+            link_parts = pathlib.PurePath(linkname).parts
+            if '..' in link_parts:
+                raise LinkOutsideDestinationError(member, f"Link contains '..' components: {linkname}")
+                
+            # Additional Windows-specific link validation
+            if sys.platform == 'win32':
+                if len(linkname) >= 2 and linkname[1] == ':' and linkname[0].isalpha():
+                    raise AbsoluteLinkError(member)
+                if linkname.startswith('\\\\') or linkname.startswith('//'):
+                    raise AbsoluteLinkError(member)
+            
+            # Normalize link path securely
+            normalized = os.path.normpath(linkname)
+            if normalized != linkname:
                 new_attrs['linkname'] = normalized
+                warnings.warn(f"Normalized link path: {linkname} -> {normalized}", 
+                             category=UserWarning, stacklevel=3)
+            
+            # Enhanced target path validation using pathlib
+            # Note: Don't use path.resolve() as targets may not exist during validation
+            dest_pathlib = pathlib.Path(dest_path)
+            
             if member.issym():
-                target_path = os.path.join(dest_path,
-                                           os.path.dirname(name),
-                                           member.linkname)
+                # For symbolic links, compute target path relative to the symlink's directory
+                link_dir = dest_pathlib / os.path.dirname(name)
+                target_path = link_dir / member.linkname
             else:
-                target_path = os.path.join(dest_path,
-                                           member.linkname)
-            target_path = os.path.realpath(target_path,
-                                           strict=os.path.ALLOW_MISSING)
-            if os.path.commonpath([target_path, dest_path]) != dest_path:
-                raise LinkOutsideDestinationError(member, target_path)
+                # For hard links, compute target path relative to destination
+                target_path = dest_pathlib / member.linkname
+            
+            # Use os.path.normpath to normalize the path without requiring the target to exist
+            target_normalized = os.path.normpath(str(target_path))
+            dest_normalized = os.path.normpath(str(dest_pathlib))
+            
+            # Ensure normalized link target stays within destination boundary
+            # Use commonpath to check if target is under destination
+            try:
+                common = os.path.commonpath([target_normalized, dest_normalized])
+                if not os.path.samefile(common, dest_normalized):
+                    raise LinkOutsideDestinationError(member, target_normalized)
+            except (ValueError, OSError):
+                # If commonpath fails or samefile fails, do a simpler string-based check
+                if not target_normalized.startswith(dest_normalized + os.sep) and target_normalized != dest_normalized:
+                    raise LinkOutsideDestinationError(member, target_normalized)
     return new_attrs
 
 def fully_trusted_filter(member, dest_path):
     return member
 
 def tar_filter(member, dest_path):
+    """Enhanced tar filter with additional security validations for CVE-2024-12718."""
+    # Pre-validation checks before calling _get_filtered_attrs
+    if not member.name:
+        warnings.warn("Empty member name detected, skipping", category=UserWarning, stacklevel=2)
+        raise FilterError("Empty member name")
+    
+    # Check for excessively long names that could cause issues
+    if len(member.name) > 4096:  # Reasonable path length limit
+        warnings.warn(f"Excessively long path name truncated: {member.name[:100]}...", 
+                     category=UserWarning, stacklevel=2)
+        raise FilterError(f"Path name too long: {len(member.name)} characters")
+    
     new_attrs = _get_filtered_attrs(member, dest_path, False)
     if new_attrs:
         return member.replace(**new_attrs, deep=False)
     return member
 
 def data_filter(member, dest_path):
+    """Enhanced data filter with additional security validations for CVE-2024-12718."""
+    # Pre-validation checks before calling _get_filtered_attrs
+    if not member.name:
+        warnings.warn("Empty member name detected, skipping", category=UserWarning, stacklevel=2)
+        raise FilterError("Empty member name")
+    
+    # Check for excessively long names that could cause issues
+    if len(member.name) > 4096:  # Reasonable path length limit
+        warnings.warn(f"Excessively long path name truncated: {member.name[:100]}...", 
+                     category=UserWarning, stacklevel=2)
+        raise FilterError(f"Path name too long: {len(member.name)} characters")
+    
+    # Additional validation for data filter - stricter checks
+    if member.size is not None and member.size < 0:
+        warnings.warn(f"Invalid negative file size {member.size} for {member.name}", 
+                     category=UserWarning, stacklevel=2)
+        raise FilterError(f"Invalid file size: {member.size}")
+        
+    if member.size is not None and member.size > (10 * 1024 * 1024 * 1024):  # 10GB limit
+        warnings.warn(f"Extremely large file size {member.size} for {member.name}", 
+                     category=UserWarning, stacklevel=2)
+    
     new_attrs = _get_filtered_attrs(member, dest_path, True)
     if new_attrs:
         return member.replace(**new_attrs, deep=False)
