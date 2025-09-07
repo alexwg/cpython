@@ -791,23 +791,17 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
     
     # Check for path traversal patterns before any processing
     if '..' in pathlib.PurePath(normalized_name).parts:
-        raise OutsideDestinationError(member, f"Path contains '..' components: {name}")
+        # Calculate the projected extraction path for the error
+        projected_path = os.path.join(dest_path, name.lstrip('/'))
+        raise OutsideDestinationError(member, projected_path)
     
-    # Strip leading / (tar's directory separator) from filenames.
-    # Include os.sep (target OS directory separator) as well.
-    if name.startswith(('/', os.sep)):
-        name = new_attrs['name'] = member.path.lstrip('/' + os.sep)
-        # Issue security warning about path normalization
-        warnings.warn(f"Normalized path with leading separators: {member.name} -> {name}", 
-                     category=UserWarning, stacklevel=3)
-    
-    # Enhanced absolute path detection for all platforms
+    # Enhanced absolute path detection for all platforms - MUST happen BEFORE stripping
     if os.path.isabs(name) or posixpath.isabs(name) or pathlib.PurePath(name).is_absolute():
-        # Path is absolute even after stripping.
-        # For example, 'C:/foo' on Windows, '/foo' on Unix
+        # Path is absolute - reject immediately
+        # For example, '/etc/passwd' on Unix, 'C:/foo' on Windows
         raise AbsolutePathError(member)
     
-    # Additional validation for Windows drive letters and UNC paths
+    # Additional validation for Windows drive letters and UNC paths - BEFORE stripping
     if sys.platform == 'win32':
         # Check for Windows drive letters (e.g., "C:", "d:")
         if len(name) >= 2 and name[1] == ':' and name[0].isalpha():
@@ -815,6 +809,21 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
         # Check for UNC paths (e.g., "\\server\share")
         if name.startswith('\\\\') or name.startswith('//'):
             raise AbsolutePathError(member)
+    
+    # Strip leading / (tar's directory separator) from filenames.
+    # Include os.sep (target OS directory separator) as well.
+    # NOTE: This happens AFTER absolute path detection to preserve security
+    if name.startswith(('/', os.sep)):
+        name = new_attrs['name'] = member.path.lstrip('/' + os.sep)
+        # Issue security warning about path normalization
+        warnings.warn(f"Normalized path with leading separators: {member.name} -> {name}", 
+                     category=UserWarning, stacklevel=3)
+    
+    # Double-check: ensure no absolute paths remain after stripping
+    if os.path.isabs(name) or posixpath.isabs(name) or pathlib.PurePath(name).is_absolute():
+        # Path is still absolute after stripping - this should not happen with proper validation
+        # For example, 'C:/foo' on Windows would remain absolute even after stripping '/'
+        raise AbsolutePathError(member)
     
     # Ensure we stay in the destination using more secure path resolution
     try:
@@ -837,7 +846,8 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
     mode = member.mode
     if mode is not None:
         # Validate mode is within reasonable bounds to prevent attacks
-        if mode < 0 or mode > 0o7777:
+        # Unix modes can include file type bits (up to 0o177777), so be less restrictive
+        if mode < 0 or mode > 0o177777:
             warnings.warn(f"Invalid file mode {oct(mode)} for {member.name}, using safe default", 
                          category=UserWarning, stacklevel=3)
             mode = 0o644 if member.isreg() else 0o755 if member.isdir() else 0o644
@@ -912,28 +922,31 @@ def _get_filtered_attrs(member, dest_path, for_data=True):
                              category=UserWarning, stacklevel=3)
             
             # Enhanced target path validation using pathlib
+            # Note: Don't use path.resolve() as targets may not exist during validation
+            dest_pathlib = pathlib.Path(dest_path)
+            
+            if member.issym():
+                # For symbolic links, compute target path relative to the symlink's directory
+                link_dir = dest_pathlib / os.path.dirname(name)
+                target_path = link_dir / member.linkname
+            else:
+                # For hard links, compute target path relative to destination
+                target_path = dest_pathlib / member.linkname
+            
+            # Use os.path.normpath to normalize the path without requiring the target to exist
+            target_normalized = os.path.normpath(str(target_path))
+            dest_normalized = os.path.normpath(str(dest_pathlib))
+            
+            # Ensure normalized link target stays within destination boundary
+            # Use commonpath to check if target is under destination
             try:
-                dest_pathlib = pathlib.Path(dest_path)
-                
-                if member.issym():
-                    # For symbolic links, resolve relative to the symlink's directory
-                    link_dir = dest_pathlib / os.path.dirname(name)
-                    target_path = link_dir / member.linkname
-                else:
-                    # For hard links, resolve relative to destination
-                    target_path = dest_pathlib / member.linkname
-                
-                # Resolve paths to detect traversal attempts
-                target_resolved = str(target_path.resolve())
-                dest_resolved = str(dest_pathlib.resolve())
-                
-                # Ensure link target stays within destination boundary
-                if not target_resolved.startswith(dest_resolved + os.sep) and target_resolved != dest_resolved:
-                    raise LinkOutsideDestinationError(member, target_resolved)
-                    
-            except (OSError, ValueError) as e:
-                # Handle link resolution errors securely
-                raise LinkOutsideDestinationError(member, f"Link resolution failed: {e}")
+                common = os.path.commonpath([target_normalized, dest_normalized])
+                if not os.path.samefile(common, dest_normalized):
+                    raise LinkOutsideDestinationError(member, target_normalized)
+            except (ValueError, OSError):
+                # If commonpath fails or samefile fails, do a simpler string-based check
+                if not target_normalized.startswith(dest_normalized + os.sep) and target_normalized != dest_normalized:
+                    raise LinkOutsideDestinationError(member, target_normalized)
     return new_attrs
 
 def fully_trusted_filter(member, dest_path):
