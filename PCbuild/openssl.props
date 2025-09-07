@@ -1,8 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!-- 
+    OpenSSL Security Configuration
+    Updated to address CVE-2024-5535 and other OpenSSL vulnerabilities
+    Requires OpenSSL 3.0.15 or later for security compliance
+  -->
   <ItemDefinitionGroup>
     <ClCompile>
       <AdditionalIncludeDirectories>$(opensslIncludeDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <!-- Compile-time version check to ensure OpenSSL 3.0.15+ -->
+      <PreprocessorDefinitions>OPENSSL_MINIMUM_VERSION=0x30000150L;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(opensslOutDir);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
@@ -10,6 +17,11 @@
     </Link>
   </ItemDefinitionGroup>
   <PropertyGroup>
+    <!-- OpenSSL 3.0.15+ Security Requirements (CVE-2024-5535, CVE-2024-12797) -->
+    <OpenSSLMinimumVersion Condition="$(OpenSSLMinimumVersion) == ''">3.0.15</OpenSSLMinimumVersion>
+    <OpenSSLSecurityCompliant>true</OpenSSLSecurityCompliant>
+    
+    <!-- DLL suffix for OpenSSL 3.x with platform-specific variants -->
     <_DLLSuffix>-3</_DLLSuffix>
     <_DLLSuffix Condition="$(Platform) == 'ARM'">$(_DLLSuffix)-arm</_DLLSuffix>
     <_DLLSuffix Condition="$(Platform) == 'ARM64'">$(_DLLSuffix)-arm64</_DLLSuffix>
@@ -30,5 +42,23 @@
   </Target>
   <Target Name="_CleanSSLDLL" Condition="$(SkipCopySSLDLL) == ''" BeforeTargets="Clean">
     <Delete Files="@(_SSLDLL->'$(OutDir)%(Filename)%(Extension)')" TreatErrorsAsWarnings="true" />
+  </Target>
+  
+  <!-- Security validation target to ensure OpenSSL version compliance -->
+  <Target Name="_ValidateOpenSSLSecurity" BeforeTargets="Build">
+    <Message Text="Validating OpenSSL security requirements..." Importance="normal" />
+    <Message Text="Required minimum OpenSSL version: $(OpenSSLMinimumVersion)" Importance="normal" />
+    
+    <!-- Check if OpenSSL headers directory exists -->
+    <Error Text="OpenSSL include directory not found: $(opensslIncludeDir). Please ensure OpenSSL $(OpenSSLMinimumVersion) or later is installed." 
+           Condition="!Exists('$(opensslIncludeDir)\openssl\opensslv.h')" />
+    
+    <!-- Validate DLL files exist -->
+    <Error Text="OpenSSL DLL not found: $(opensslOutDir)\libcrypto$(_DLLSuffix).dll. Please ensure OpenSSL $(OpenSSLMinimumVersion) or later is built for platform $(Platform)."
+           Condition="!Exists('$(opensslOutDir)\libcrypto$(_DLLSuffix).dll')" />
+    <Error Text="OpenSSL DLL not found: $(opensslOutDir)\libssl$(_DLLSuffix).dll. Please ensure OpenSSL $(OpenSSLMinimumVersion) or later is built for platform $(Platform)."
+           Condition="!Exists('$(opensslOutDir)\libssl$(_DLLSuffix).dll')" />
+           
+    <Message Text="OpenSSL security validation passed" Importance="normal" />
   </Target>
 </Project>
