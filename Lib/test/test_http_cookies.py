@@ -218,7 +218,7 @@ class CookieTests(unittest.TestCase):
             ('backslash_flood', r'\"' * 10000),  # Many escaped quotes
             ('mixed_escapes', (r'\"' + r'\\' + r'\n' + r'\t') * 2500),  # Mixed escape sequences
             ('octal_sequences', r'\377\376\375' * 3333),  # Many octal sequences
-            ('deep_nesting', r'\\' * 50 + r'\"' * 50) * 100,  # Alternating patterns
+            ('deep_nesting', (r'\\' * 50 + r'\"' * 50) * 100),  # Alternating patterns
         ]
         
         max_allowed_time = 5.0  # Maximum seconds allowed for parsing
