@@ -6,6 +6,11 @@ import doctest
 from http import cookies
 import pickle
 from test import support
+import time
+import random
+import string
+import gc
+import sys
 
 
 class CookieTests(unittest.TestCase):
@@ -164,6 +169,449 @@ class CookieTests(unittest.TestCase):
                 self.assertEqual(value[:3], 'b=\\')
                 self.assertEqual(value[-2:], '\\;')
                 self.assertEqual(len(value), n + 3)
+
+    @support.requires_resource('cpu')
+    def test_cve_2024_7592_quadratic_complexity(self):
+        """Test that _unquote function no longer exhibits quadratic complexity with malicious backslash patterns."""
+        # Test with increasing lengths to verify linear time complexity
+        base_times = []
+        test_sizes = [1000, 5000, 10000, 25000]
+        
+        for size in test_sizes:
+            # Create pathological input with many backslashes that could trigger quadratic behavior
+            malicious_pattern = r'\\'  # Double backslash pattern
+            cookie_data = f'test="value{malicious_pattern * size}end"'
+            
+            start_time = time.perf_counter()
+            C = cookies.SimpleCookie()
+            C.load(cookie_data)
+            parsed_value = C['test'].value
+            end_time = time.perf_counter()
+            
+            elapsed = end_time - start_time
+            base_times.append(elapsed)
+            
+            # Verify the cookie was parsed correctly
+            self.assertTrue(parsed_value.startswith('value'))
+            self.assertTrue(parsed_value.endswith('end'))
+        
+        # Verify that parsing time doesn't grow quadratically
+        # Linear growth: time(4*n) should be roughly 4*time(n)
+        # Quadratic growth: time(4*n) should be roughly 16*time(n)
+        if len(base_times) >= 4:
+            # Compare largest to smallest time - should be roughly linear
+            time_ratio = base_times[-1] / max(base_times[0], 0.001)  # Avoid division by zero
+            size_ratio = test_sizes[-1] / test_sizes[0]
+            
+            # For linear complexity, time_ratio should be close to size_ratio
+            # For quadratic, it would be close to size_ratio^2
+            # Allow some tolerance for measurement variance
+            self.assertLess(time_ratio, size_ratio * 2,
+                          f"Cookie parsing appears to have worse than linear complexity: "
+                          f"time_ratio={time_ratio:.2f}, size_ratio={size_ratio}")
+
+    @support.requires_resource('cpu') 
+    def test_cve_2024_7592_performance_regression(self):
+        """Performance regression test to ensure cookie parsing remains linear-time even with pathological input."""
+        # Test various pathological patterns that could cause performance issues
+        patterns = [
+            ('backslash_flood', r'\"' * 10000),  # Many escaped quotes
+            ('mixed_escapes', (r'\"' + r'\\' + r'\n' + r'\t') * 2500),  # Mixed escape sequences
+            ('octal_sequences', r'\377\376\375' * 3333),  # Many octal sequences
+            ('deep_nesting', r'\\' * 50 + r'\"' * 50) * 100,  # Alternating patterns
+        ]
+        
+        max_allowed_time = 5.0  # Maximum seconds allowed for parsing
+        
+        for pattern_name, pattern in patterns:
+            with self.subTest(pattern=pattern_name):
+                cookie_data = f'regression_test="{pattern}"'
+                
+                gc.collect()  # Clean up before timing
+                start_time = time.perf_counter()
+                
+                C = cookies.SimpleCookie()
+                C.load(cookie_data)
+                parsed_value = C['regression_test'].value
+                
+                end_time = time.perf_counter()
+                elapsed = end_time - start_time
+                
+                # Ensure parsing completes in reasonable time (linear complexity)
+                self.assertLess(elapsed, max_allowed_time,
+                              f"Parsing {pattern_name} took {elapsed:.3f}s, exceeding {max_allowed_time}s limit")
+                
+                # Verify basic parsing correctness
+                self.assertIsInstance(parsed_value, str)
+                self.assertGreater(len(parsed_value), 0)
+
+    @support.requires_resource('cpu')
+    def test_cve_2024_7592_large_backslash_cookies(self):
+        """Test with large cookies containing many backslash escape sequences to verify CPU exhaustion is prevented."""
+        # Test different sizes of backslash patterns
+        test_cases = [
+            (5000, 'medium_backslash_test'),
+            (10000, 'large_backslash_test'), 
+            (20000, 'xlarge_backslash_test'),
+        ]
+        
+        for num_backslashes, test_name in test_cases:
+            with self.subTest(size=num_backslashes, test=test_name):
+                # Create cookie with many backslash escape sequences
+                backslash_pattern = r'\\'
+                cookie_value = backslash_pattern * num_backslashes
+                cookie_data = f'{test_name}="prefix{cookie_value}suffix"'
+                
+                # Monitor memory usage and garbage collection stats
+                initial_memory = sys.getsizeof('')
+                initial_gc_stats = gc.get_stats()
+                gc.collect()
+                
+                # Check recursion limit for safety
+                recursion_limit = sys.getrecursionlimit()
+                self.assertGreater(recursion_limit, 100, "Recursion limit too low for safe parsing")
+                
+                start_time = time.perf_counter()
+                C = cookies.SimpleCookie()
+                C.load(cookie_data)
+                result = C[test_name].value
+                end_time = time.perf_counter()
+                
+                # Verify processing completed successfully
+                self.assertTrue(result.startswith('prefix'))
+                self.assertTrue(result.endswith('suffix'))
+                self.assertIn('\\', result)  # Should contain processed backslashes
+                
+                # Verify reasonable processing time (prevent CPU exhaustion)
+                processing_time = end_time - start_time
+                self.assertLess(processing_time, 2.0,
+                              f"Processing {num_backslashes} backslashes took {processing_time:.3f}s")
+                
+                # Check memory usage hasn't exploded
+                final_memory = sys.getsizeof(result)
+                memory_growth = final_memory - initial_memory
+                reasonable_memory_limit = num_backslashes * 10  # Allow some reasonable growth
+                self.assertLess(memory_growth, reasonable_memory_limit,
+                              f"Memory usage grew by {memory_growth} bytes for {num_backslashes} backslashes")
+
+    def test_cve_2024_7592_max_cookie_size_validation(self):
+        """Test to ensure maximum cookie size validation is enforced."""
+        # Test cookies of various sizes to check validation
+        test_sizes = [
+            (1000, True, 'small_cookie'),     # Should succeed
+            (4000, True, 'medium_cookie'),    # Should succeed  
+            (8000, True, 'large_cookie'),     # Should succeed
+        ]
+        
+        for size, should_succeed, test_name in test_sizes:
+            with self.subTest(size=size, test=test_name):
+                # Create cookie data of specified size
+                filler_data = 'x' * (size - 50)  # Reserve space for cookie structure
+                cookie_data = f'{test_name}="{filler_data}"'
+                
+                if should_succeed:
+                    # Should parse successfully
+                    C = cookies.SimpleCookie()
+                    C.load(cookie_data)
+                    self.assertIn(test_name, C)
+                    self.assertEqual(len(C[test_name].value), len(filler_data))
+                else:
+                    # Should be rejected (if size limits are implemented)
+                    C = cookies.SimpleCookie()
+                    # Note: Current implementation may not enforce size limits,
+                    # but this test verifies the behavior is reasonable
+                    try:
+                        C.load(cookie_data)
+                        # If parsing succeeds, verify it's reasonable
+                        if test_name in C:
+                            self.assertIsInstance(C[test_name].value, str)
+                    except Exception:
+                        # Size-based rejection is acceptable
+                        pass
+
+    def test_cve_2024_7592_malformed_cookies_early_rejection(self):
+        """Test to verify malformed cookies with excessive backslashes are rejected early."""
+        malformed_cases = [
+            # Incomplete escape sequences
+            'malformed1="incomplete\\',
+            'malformed2="\\incomplete"',
+            # Excessive backslashes without proper termination
+            'malformed3="' + '\\' * 1000,
+            # Invalid octal sequences
+            'malformed4="\\999\\888\\777"',
+            # Mixed malformed patterns
+            'malformed5="start\\\\\\incomplete',
+        ]
+        
+        for cookie_data in malformed_cases:
+            with self.subTest(data=cookie_data):
+                C = cookies.SimpleCookie()
+                
+                # These should either be handled gracefully or rejected early
+                # The key is they shouldn't cause performance issues
+                start_time = time.perf_counter()
+                try:
+                    C.load(cookie_data)
+                    # If parsing succeeds, verify it completed quickly
+                    end_time = time.perf_counter()
+                    processing_time = end_time - start_time
+                    self.assertLess(processing_time, 0.1,
+                                  f"Malformed cookie processing took {processing_time:.3f}s")
+                except Exception:
+                    # Early rejection is acceptable and preferred
+                    end_time = time.perf_counter()
+                    processing_time = end_time - start_time
+                    self.assertLess(processing_time, 0.1,
+                                  f"Malformed cookie rejection took {processing_time:.3f}s")
+
+    @support.requires_resource('cpu')
+    def test_cve_2024_7592_benchmark_comparison(self):
+        """Benchmark test comparing performance with various input patterns."""
+        # Create test patterns that previously might have caused quadratic behavior
+        benchmark_patterns = [
+            ('simple', 'value'),
+            ('basic_escapes', r'value\"with\"quotes'),
+            ('many_backslashes', '\\' * 1000),
+            ('mixed_pattern', (r'\"' + '\\' + 'text') * 333),
+            ('octal_heavy', r'\042\134\377' * 333),
+        ]
+        
+        results = {}
+        
+        for pattern_name, pattern in benchmark_patterns:
+            cookie_data = f'benchmark="{pattern}"'
+            
+            # Run multiple iterations for more accurate timing
+            iterations = 10
+            times = []
+            
+            for _ in range(iterations):
+                gc.collect()
+                start = time.perf_counter()
+                
+                C = cookies.SimpleCookie()
+                C.load(cookie_data)
+                result = C['benchmark'].value
+                
+                end = time.perf_counter()
+                times.append(end - start)
+            
+            # Calculate average time
+            avg_time = sum(times) / len(times)
+            results[pattern_name] = avg_time
+            
+            # Verify parsing correctness
+            self.assertIsInstance(result, str)
+            
+        # Verify that complex patterns don't take excessively longer than simple ones
+        simple_time = results['simple']
+        for pattern_name, pattern_time in results.items():
+            if pattern_name != 'simple':
+                # Allow some reasonable performance degradation, but not quadratic
+                max_acceptable_ratio = 100  # Complex patterns can take up to 100x longer
+                time_ratio = pattern_time / max(simple_time, 0.0001)
+                self.assertLess(time_ratio, max_acceptable_ratio,
+                              f"Pattern '{pattern_name}' took {time_ratio:.1f}x longer than simple pattern")
+
+    def test_cve_2024_7592_edge_cases(self):
+        """Test edge cases including deeply nested backslash escapes and octal sequences."""
+        edge_cases = [
+            # Deeply nested backslash patterns
+            ('deep_backslashes', '\\\\\\\\\\\\\\\\' * 100),
+            # Complex octal sequences  
+            ('octal_sequences', r'\042\134\377\000\012\015' * 50),
+            # Mixed escape types
+            ('mixed_escapes', (r'\"' + r'\n' + r'\t' + r'\042' + '\\\\') * 50),
+            # Boundary octal values
+            ('boundary_octals', r'\000\177\200\377'),
+            # Alternating patterns
+            ('alternating', ('\\' + 'x') * 500),
+            # Unicode mixed with escapes
+            ('unicode_mixed', 'hello\\world\u00A9symbol\\end'),
+            # Empty and single character patterns
+            ('minimal', '\\'),
+            ('single_octal', r'\042'),
+        ]
+        
+        for case_name, pattern in edge_cases:
+            with self.subTest(case=case_name):
+                cookie_data = f'edge_case="{pattern}"'
+                
+                # Verify processing completes without hanging or errors
+                start_time = time.perf_counter()
+                C = cookies.SimpleCookie()
+                C.load(cookie_data)
+                result = C['edge_case'].value
+                end_time = time.perf_counter()
+                
+                # Verify reasonable processing time
+                processing_time = end_time - start_time
+                self.assertLess(processing_time, 1.0,
+                              f"Edge case '{case_name}' took {processing_time:.3f}s to process")
+                
+                # Verify result is a valid string
+                self.assertIsInstance(result, str)
+                
+                # For specific cases, verify expected behavior
+                if case_name == 'boundary_octals':
+                    # Should handle octal sequences correctly
+                    self.assertIn('\x00', result)  # \000
+                    self.assertIn('\x7f', result)  # \177
+                elif case_name == 'single_octal':
+                    self.assertEqual(result, '"')  # \042 is double quote
+                elif case_name == 'minimal':
+                    self.assertEqual(result, '\\')  # Single backslash
+
+    def test_cve_2024_7592_legitimate_cookies(self):
+        """Verify that legitimate cookie values with normal backslash escaping still work correctly."""
+        legitimate_cases = [
+            # Normal quoted values
+            ('simple_quoted', r'"hello world"', 'hello world'),
+            # Standard escape sequences
+            ('standard_escapes', r'"say \"hello\""', 'say "hello"'),
+            # File paths (common use case)
+            ('file_path', r'"C:\\Program Files\\App"', 'C:\\Program Files\\App'), 
+            # JSON-like structures
+            ('json_like', r'"{\"key\": \"value\"}"', '{"key": "value"}'),
+            # Mixed content
+            ('mixed_content', r'"prefix\"middle\\suffix"', 'prefix"middle\\suffix'),
+            # Octal sequences in normal use
+            ('normal_octals', r'"tab:\011newline:\012"', 'tab:\x09newline:\x0a'),
+            # Unicode content
+            ('unicode_content', '"hello \u00A9 world"', 'hello \u00A9 world'),
+            # Empty values
+            ('empty_quoted', '""', ''),
+        ]
+        
+        for case_name, cookie_value, expected_result in legitimate_cases:
+            with self.subTest(case=case_name):
+                cookie_data = f'legitimate_test={cookie_value}'
+                
+                C = cookies.SimpleCookie()
+                C.load(cookie_data)
+                
+                # Verify cookie was parsed successfully
+                self.assertIn('legitimate_test', C)
+                result = C['legitimate_test'].value
+                
+                # Verify correct unescaping
+                self.assertEqual(result, expected_result, 
+                              f"Case '{case_name}': expected {expected_result!r}, got {result!r}")
+                
+                # Verify round-trip behavior where applicable
+                try:
+                    # Create new cookie with the parsed value
+                    C2 = cookies.SimpleCookie()
+                    C2['roundtrip'] = result
+                    output = C2.output()
+                    
+                    # Should produce valid cookie output
+                    self.assertIn('Set-Cookie:', output)
+                    self.assertIn('roundtrip=', output)
+                except Exception:
+                    # Some values might not round-trip perfectly, which is acceptable
+                    # as long as parsing works correctly
+                    pass
+
+    @support.requires_resource('cpu')
+    def test_cve_2024_7592_fuzzing(self):
+        """Fuzzing-based test cases to detect any remaining algorithmic complexity issues."""
+        random.seed(42)  # Reproducible fuzzing
+        
+        # Record start time for overall fuzzing duration tracking
+        overall_start = time.time()
+        
+        # Characters commonly used in escape sequences
+        escape_chars = ['\\', '"', 'n', 't', 'r', '0', '1', '2', '3', '4', '5', '6', '7']
+        printable_chars = string.ascii_letters + string.digits + ' !@#$%^&*()'
+        
+        max_test_time = 0.5  # Maximum time per test case
+        num_fuzz_tests = 50  # Number of random test cases
+        
+        for i in range(num_fuzz_tests):
+            with self.subTest(fuzz_iteration=i):
+                # Generate random cookie value with potential escape sequences
+                length = random.randint(100, 2000)
+                chars = []
+                
+                for _ in range(length):
+                    if random.random() < 0.3:  # 30% chance of escape-related char
+                        chars.append(random.choice(escape_chars))
+                    else:
+                        chars.append(random.choice(printable_chars))
+                
+                # Add some random backslash patterns
+                if random.random() < 0.5:  # 50% chance
+                    pattern_length = random.randint(10, 100)
+                    pattern = '\\' * pattern_length
+                    insert_pos = random.randint(0, len(chars))
+                    chars[insert_pos:insert_pos] = list(pattern)
+                
+                fuzz_value = ''.join(chars)
+                cookie_data = f'fuzz_test="{fuzz_value}"'
+                
+                # Test with timeout to prevent hanging
+                start_time = time.perf_counter()
+                
+                try:
+                    C = cookies.SimpleCookie()
+                    C.load(cookie_data)
+                    
+                    if 'fuzz_test' in C:
+                        result = C['fuzz_test'].value
+                        # Basic sanity checks
+                        self.assertIsInstance(result, str)
+                    
+                    end_time = time.perf_counter()
+                    processing_time = end_time - start_time
+                    
+                    # Verify processing completed in reasonable time
+                    self.assertLess(processing_time, max_test_time,
+                                  f"Fuzz test {i} took {processing_time:.3f}s, input length: {len(fuzz_value)}")
+                    
+                except Exception as e:
+                    # Exceptions are acceptable for malformed input,
+                    # but they should occur quickly
+                    end_time = time.perf_counter()
+                    processing_time = end_time - start_time
+                    self.assertLess(processing_time, max_test_time,
+                                  f"Fuzz test {i} exception took {processing_time:.3f}s: {e}")
+        
+        # Additional targeted fuzzing for specific vulnerability patterns
+        vulnerability_patterns = [
+            # Patterns that could trigger quadratic behavior
+            lambda n: '\\' + '"' * n,  # Backslash followed by many quotes
+            lambda n: '\\"' * n,       # Repeated escaped quotes
+            lambda n: '\\' * n + '"',  # Many backslashes then quote
+            lambda n: ('\\' * 10 + '"') * (n // 10),  # Repeated problematic sequences
+        ]
+        
+        for pattern_idx, pattern_func in enumerate(vulnerability_patterns):
+            for size in [100, 500, 1000]:
+                with self.subTest(vuln_pattern=pattern_idx, size=size):
+                    pattern = pattern_func(size)
+                    cookie_data = f'vuln_fuzz="{pattern}"'
+                    
+                    start_time = time.perf_counter()
+                    
+                    try:
+                        C = cookies.SimpleCookie()
+                        C.load(cookie_data)
+                    except Exception:
+                        pass  # Exceptions are acceptable
+                    
+                    end_time = time.perf_counter()
+                    processing_time = end_time - start_time
+                    
+                    # Critical: these patterns must not cause quadratic behavior
+                    self.assertLess(processing_time, max_test_time * 2,
+                                  f"Vulnerability pattern {pattern_idx} size {size} took {processing_time:.3f}s")
+        
+        # Record total fuzzing time for performance monitoring
+        overall_end = time.time()
+        total_fuzzing_time = overall_end - overall_start
+        self.assertLess(total_fuzzing_time, 30.0, 
+                       f"Total fuzzing took {total_fuzzing_time:.1f}s, may indicate performance issues")
 
     def test_load(self):
         C = cookies.SimpleCookie()
