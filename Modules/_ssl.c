@@ -3776,6 +3776,21 @@ do_protocol_selection(int alpn, unsigned char **out, unsigned char *outlen,
         server_protocols_len = 0;
     }
 
+    /* CVE-2024-5535: Fix buffer over-read vulnerability by validating protocol buffer lengths.
+     * SSL_select_next_proto with empty protocol buffers can cause buffer over-read and
+     * potential information disclosure. Early return prevents calling OpenSSL API with
+     * empty buffers that could lead to memory contents being sent to the peer. */
+    if (client_protocols_len == 0 || server_protocols_len == 0) {
+        /* No protocols to negotiate - return appropriate error */
+        if (alpn) {
+            return SSL_TLSEXT_ERR_NOACK;
+        }
+        /* For NPN, set empty result and return OK to maintain compatibility */
+        *out = NULL;
+        *outlen = 0;
+        return SSL_TLSEXT_ERR_OK;
+    }
+
     ret = SSL_select_next_proto(out, outlen,
                                 server_protocols, server_protocols_len,
                                 client_protocols, client_protocols_len);
